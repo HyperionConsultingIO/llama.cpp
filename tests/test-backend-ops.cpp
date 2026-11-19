@@ -4890,10 +4890,16 @@ struct test_mamba3_mimo : public test_case {
     const double  max_err;
     const bool    views;    // projections and state are offset views, the projections with padded rows
     const int     big_rms;  // B/C values whose squares overflow a float: 1 one per group, 2 all of them
+    const int     lost_gamma; // one head, one state row, exact inputs for the prefill form: 1 a first trapezoid
+                              // weight that is rounded away, 2 a correction whose rounding depends on its grouping,
+                              // 3 and 4 (d_qk = 28) sums over d that lose their small terms only in index order:
+                              // the output contraction (r = 1) and the k.q products (r = 8), 5 the same for
+                              // the direct form with d_qk = 4, the one size whose order no CPU build changes
 
     std::string vars() override {
         return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs) +
-               (views ? ",views=1" : "") + (big_rms ? ",big_rms=" + std::to_string(big_rms) : "");
+               (views ? ",views=1" : "") + (big_rms ? ",big_rms=" + std::to_string(big_rms) : "") +
+               (lost_gamma ? ",lost_gamma=" + std::to_string(lost_gamma) : "");
     }
 
     double max_nmse_err() override {
@@ -4901,9 +4907,10 @@ struct test_mamba3_mimo : public test_case {
     }
 
     test_mamba3_mimo(int64_t d_qk = 128, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
-            int64_t n_seq_tokens = 1, int64_t n_seqs = 1, double max_err = 1e-6, bool views = false, int big_rms = 0)
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1, double max_err = 1e-6, bool views = false, int big_rms = 0,
+            int lost_gamma = 0)
         : d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
-          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), max_err(max_err), views(views), big_rms(big_rms) {}
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), max_err(max_err), views(views), big_rms(big_rms), lost_gamma(lost_gamma) {}
 
     // a (ne0, ne1) view that starts one float into its buffer, with `pad` unused floats after every row
     ggml_tensor * offset_view(ggml_context * ctx, int64_t ne0, int64_t ne1, int64_t pad) {
@@ -4919,11 +4926,17 @@ struct test_mamba3_mimo : public test_case {
         ggml_tensor * pstat  = views ? offset_view(ctx, (2*d_v + 3)*H, n_tok, 5)
                                      : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2*d_v + 3)*H, n_tok);
         ggml_set_name(pdyn, "pdyn");
+        ggml_set_name(pstat, "pstat");
         ggml_tensor * bias   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_qk, 2*r, H);
         ggml_tensor * mxz    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, 2*r, H);
         ggml_tensor * mimo_o = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, r, H);
         ggml_tensor * norms  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_qk, 2);
         ggml_tensor * misc   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
+        ggml_set_name(bias, "bias");
+        ggml_set_name(mxz, "mxz");
+        ggml_set_name(mimo_o, "mimo_o");
+        ggml_set_name(norms, "norms");
+        ggml_set_name(misc, "misc");
         ggml_tensor * state  = views ? offset_view(ctx, n_embd_s, n_seqs, 0)
                                      : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
         ggml_set_name(state, "state");
@@ -4936,6 +4949,77 @@ struct test_mamba3_mimo : public test_case {
                 init_tensor_uniform(t, -0.5f, 0.5f);
             } else {
                 init_tensor_uniform(t);
+            }
+        }
+        if (lost_gamma) {
+            // d_qk = 4, r = d_v = H = n_seqs = 1, four tokens. k = q = (1, 0, 0, 0), v = w = 1 for
+            // the first token, whose trapezoid weight is 16; the next token's delta is 2^30.
+            // From four tokens on the CPU folds the two into one coefficient, 16 + 2^30 = 2^30,
+            // and takes delta out again: y_0 = 0, where the token-by-token recurrence gives 16.
+            // Mode 2: k = v = 4097, q = 1.5, gamma = 0, delta = 16. v*(k.q) and (v*k).q round
+            // differently, and y_0 is -32 with the CPU's grouping, 0 with the other
+            // Mode 5, direct form (one token, d_v = 128): S = 1, dt = 0, v = w = 1,
+            // q = (2^24, 1, 1, 1), D = -2^24. In index order the contraction is 2^24 and y = 0
+            GGML_ASSERT(d_qk == (lost_gamma == 3 || lost_gamma == 4 ? 28 : 4) && r == (lost_gamma == 4 ? 8 : 1));
+            GGML_ASSERT(d_v == (lost_gamma == 5 ? 128 : 1) && n_seq_tokens == (lost_gamma == 5 ? 1 : 4));
+            GGML_ASSERT(head_count == 1 && n_seqs == 1);
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                if (lost_gamma == 5) {
+                    if (strcmp(t->name, "pstat") == 0) {
+                        std::fill(data.begin(), data.begin() + d_v, 32.0f);           // z
+                        std::fill(data.begin() + d_v, data.begin() + 2*d_v, 1.0f);    // x
+                        data[2*d_v] = -200.0f;                                        // dt
+                    } else if (strcmp(t->name, "bias") == 0) {
+                        data[r*d_qk] = 16777216.0f;
+                        data[r*d_qk + 1] = data[r*d_qk + 2] = data[r*d_qk + 3] = 1.0f;
+                    } else if (strcmp(t->name, "mxz") == 0 || strcmp(t->name, "norms") == 0) {
+                        std::fill(data.begin(), data.end(), 1.0f);
+                    } else if (strcmp(t->name, "mimo_o") == 0) {
+                        std::fill(data.begin(), data.end(), 1.0f/32.0f);
+                    } else if (strcmp(t->name, "misc") == 0) {
+                        data[head_count] = -16777216.0f;                              // D
+                    } else if (strcmp(t->name, "state") == 0) {
+                        std::fill(data.begin(), data.begin() + d_v*d_qk, 1.0f);
+                    }
+                } else if (strcmp(t->name, "pstat") == 0) {
+                    // per token: z, x, dt, a, trap (before softplus/sigmoid)
+                    const float rows[3][4][5] = {{
+                        { 32.0f, 1.0f, 32.0f,         32.0f, 0.0f },
+                        {  0.0f, 0.0f, 2147483648.0f, 32.0f, 0.0f },
+                        {  0.0f, 0.0f, 0.0f,          32.0f, 0.0f },
+                        {  0.0f, 0.0f, 0.0f,          32.0f, 0.0f },
+                    }, {
+                        { 32.0f, 4097.0f, 32.0f, 32.0f, -200.0f },
+                        {  0.0f,    0.0f, 16.0f, 32.0f, -200.0f },
+                        {  0.0f,    0.0f,  0.0f, 32.0f, -200.0f },
+                        {  0.0f,    0.0f,  0.0f, 32.0f, -200.0f },
+                    }, {
+                        { 32.0f, 1.0f, 32.0f, 32.0f, -200.0f },
+                        {  0.0f, 0.0f, 16.0f, 32.0f, -200.0f },
+                        {  0.0f, 0.0f,  0.0f, 32.0f, -200.0f },
+                        {  0.0f, 0.0f,  0.0f, 32.0f, -200.0f },
+                    }};
+                    memcpy(data.data(), rows[std::min(lost_gamma, 3) - 1], sizeof(rows[0]));
+                } else if (strcmp(t->name, "bias") == 0) {
+                    if (lost_gamma >= 3) {
+                        // k and q of rank 0: three positive terms, the large one first
+                        const int far = lost_gamma == 3 ? 24 : 12;
+                        float * k = data.data();
+                        float * q = data.data() + r * d_qk;
+                        k[7] = k[8] = k[far] = 1.0f;
+                        q[7] = 16777216.0f;
+                        q[8] = q[far] = 1.0f;
+                    } else {
+                        data[0] = lost_gamma == 2 ? 4097.0f : 1.0f;
+                        data[4] = lost_gamma == 2 ? 1.5f : 1.0f;
+                    }
+                } else if (strcmp(t->name, "mxz") == 0 || strcmp(t->name, "norms") == 0) {
+                    std::fill(data.begin(), data.end(), 1.0f);
+                } else if (strcmp(t->name, "mimo_o") == 0) {
+                    data[0] = 1.0f/32.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             }
         }
         if (big_rms) {
@@ -11992,6 +12076,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mamba3_mimo( 64, 4, 32,  3,   4, 2, 1e-7, false, 1)); // rms of values whose squares overflow a float
     test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   1, 1, 1e-7, false, 1));
     test_cases.emplace_back(new test_mamba3_mimo( 64, 4, 32,  3,   4, 2, 1e-7, false, 2)); // and whose mean square does too
+    test_cases.emplace_back(new test_mamba3_mimo(  4, 1,  1,  1,   4, 1, 1e-7, false, 0, 1)); // prefill evaluation order
+    test_cases.emplace_back(new test_mamba3_mimo(  4, 1,  1,  1,   4, 1, 1e-7, false, 0, 2));
+    test_cases.emplace_back(new test_mamba3_mimo( 28, 1,  1,  1,   4, 1, 1e-7, false, 0, 3));
+    test_cases.emplace_back(new test_mamba3_mimo( 28, 8,  1,  1,   4, 1, 1e-7, false, 0, 4));
+    test_cases.emplace_back(new test_mamba3_mimo(  4, 1, 128, 1,   1, 1, 1e-7, false, 0, 5));
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 192, 2, 1e-7)); // multi-sequence prefill
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   3, 2, 1e-7)); // below the prefill threshold
     test_cases.emplace_back(new test_geodesic_collinear(1, 2, 3.0f, 1.0f)); // g - x/3: zero or 2^-25 depending on contraction
     // (type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale); Olala 7A1B: bf16, 1536, 384, 256, 768, 1536, 6, 2.45
     test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 1));

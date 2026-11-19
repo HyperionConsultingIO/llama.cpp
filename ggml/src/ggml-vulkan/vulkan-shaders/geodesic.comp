@@ -11,22 +11,16 @@
 // coefficient x.g/|x|^2 that is one ulp off turns an exactly collinear g into
 // a spurious tangent that the normalization then amplifies.
 //
-// With USE_FP64 the shader reduces the sums in double too, in parallel (NTH
+// The shader reduces the sums in double too, in parallel (NTH
 // partials -> NRED partials -> every invocation adds the last NRED; no subgroup
 // operations). A float product is exact in double, so the parallel and the
 // CPU-order sum differ by at most 2(n-1)u*sum|terms| (u = 2^-53). When every
 // value within that distance rounds to the same float, the parallel sum is
 // the CPU's result. Otherwise the row is ambiguous, and the first invocation
 // redoes the sum serially in the CPU's order.
-//
-// Without USE_FP64 the sums are float and not CPU-exact; the backend only uses
-// that variant when asked to.
+// The op needs shaderFloat64: float sums are not CPU-exact.
 
-#if USE_FP64
 #define ACC_TYPE double
-#else
-#define ACC_TYPE float
-#endif
 
 #define NTH  256
 #define NRED 16
@@ -61,12 +55,8 @@ shared ACC_TYPE s_b;
 
 // true when a sum in another order of terms of total magnitude a could round to a different float
 bool ambiguous(const ACC_TYPE s, const ACC_TYPE a) {
-#if USE_FP64
     const double d = double(n) * a * 4.440892098500626e-16LF; // 4u per term, twice the bound
     return float(s - d) != float(s + d);
-#else
-    return false;
-#endif
 }
 
 // g - coef*x, fused: the reference CPU build (x86-64 with FMA, contraction on)

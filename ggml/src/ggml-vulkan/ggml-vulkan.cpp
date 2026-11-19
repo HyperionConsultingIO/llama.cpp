@@ -3741,19 +3741,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
-    // the CPU accumulates these sums in double; match it where the device can
-    const bool mamba3_fp64 = device->shader_float64 && getenv("GGML_VK_MAMBA3_NO_FP64") == nullptr;
-    if (device->shader_float64 && getenv("GGML_VK_GEODESIC_NO_FP64") == nullptr) {
-        ggml_vk_create_pipeline(device, device->pipeline_geodesic_f32, "geodesic_f32_fp64", geodesic_f32_fp64_len, geodesic_f32_fp64_data, "main", 5, sizeof(vk_op_geodesic_push_constants), {1, 1, 1}, {}, 1, true);
-    } else {
+    // the CPU accumulates sums of these ops in double, and so do the shaders
+    if (device->shader_float64) {
         ggml_vk_create_pipeline(device, device->pipeline_geodesic_f32, "geodesic_f32", geodesic_f32_len, geodesic_f32_data, "main", 5, sizeof(vk_op_geodesic_push_constants), {1, 1, 1}, {}, 1, true);
     }
 
     for (auto &m : device->pipeline_mamba3_mimo_f32) {
         const std::string name = "mamba3_mimo_f32_r" + std::to_string(m.first[0]) + "_qk" + std::to_string(m.first[1]) + "_v" + std::to_string(m.first[2]) +
                                  "_s" + std::to_string(m.first[3]) + (m.first[4] ? "_reg" : "");
-        ggml_vk_create_pipeline2(device, m.second, name, mamba3_fp64 ? mamba3_mimo_f32_fp64_len : mamba3_mimo_f32_len,
-                                 mamba3_fp64 ? mamba3_mimo_f32_fp64_data : mamba3_mimo_f32_data, "main", 9, sizeof(vk_op_mamba3_mimo_push_constants), {1, 1, 1},
+        ggml_vk_create_pipeline2(device, m.second, name, mamba3_mimo_f32_len, mamba3_mimo_f32_data, "main", 9, sizeof(vk_op_mamba3_mimo_push_constants), {1, 1, 1},
                                  {m.first[0], m.first[1], m.first[2], m.first[3], m.first[4]}, 1, true);
     }
 
@@ -10280,7 +10276,8 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
 // invocations per state row and whether the state stays in registers, for mamba3_mimo.comp
 static void ggml_vk_mamba3_mimo_layout(uint32_t D_qk, uint32_t D_v, uint32_t T, uint32_t & nsl, uint32_t & reg) {
     nsl = 1;
-    while (nsl * 2 * D_v <= 256 && nsl * 2 <= D_qk) {
+    // D_qk == 4 is the one size whose direct-form sum every CPU build adds in index order
+    while (D_qk > 4 && nsl * 2 * D_v <= 256 && nsl * 2 <= D_qk) {
         nsl *= 2;
     }
     // with one token the state is read and written once either way
@@ -10290,9 +10287,17 @@ static void ggml_vk_mamba3_mimo_layout(uint32_t D_qk, uint32_t D_v, uint32_t T, 
     }
 }
 
-// shared memory used by mamba3_mimo.comp, in bytes (the rms partials are a double or two floats)
+// a binding starts at an aligned offset at or before the tensor, and the shader indexes it from
+// there in 32-bit float counts: true when tensor plus the largest such prefix is addressable
+static bool ggml_vk_float_binding_supported(const vk_device& device, const ggml_tensor * t) {
+    const size_t size = ggml_nbytes(t) + device->properties.limits.minStorageBufferOffsetAlignment;
+    // the pipelines of these ops are not the 64-bit indexing variants
+    return size / sizeof(float) <= UINT32_MAX && size <= device->properties.limits.maxStorageBufferRange;
+}
+
+// shared memory used by mamba3_mimo.comp, in bytes: kb, qb, vb, zb, cs, sn, rms, gram, opart, gpart
 static size_t ggml_vk_mamba3_mimo_shmem(uint32_t R, uint32_t D_qk, uint32_t D_v) {
-    return sizeof(float) * ((size_t) 3*R*D_qk + 3*R*D_v + 2*(D_qk/4) + 2*R + 3*256);
+    return sizeof(float) * ((size_t) 3*R*D_qk + 3*R*D_v + 2*(D_qk/4) + 2*R + R*R + (R + 1)*256);
 }
 
 // result form only: dst = y (D_v, H, n_tok) followed by the new state rows
@@ -16075,9 +16080,21 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 auto device = ggml_vk_get_device(ctx->device);
+                if (!ggml_vk_float_binding_supported(device, op)) {
+                    return false;
+                }
+                for (int i = 0; i < 8; i++) {
+                    if (!ggml_vk_float_binding_supported(device, op->src[i])) {
+                        return false;
+                    }
+                }
                 // one workgroup per (head, sequence)
                 if (H < 1 || (uint64_t) H > device->properties.limits.maxComputeWorkGroupCount[1] ||
                     (uint64_t) n_seqs > device->properties.limits.maxComputeWorkGroupCount[2]) {
+                    return false;
+                }
+                // the rms sums are double, as on the CPU
+                if (!device->shader_float64) {
                     return false;
                 }
                 if (ggml_vk_mamba3_mimo_shmem(R, D_qk, D_v) > device->properties.limits.maxComputeSharedMemorySize ||
@@ -16116,10 +16133,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 auto device = ggml_vk_get_device(ctx->device);
                 // float sums leave a spurious tangent on rows where g is collinear with x
-                // (see test_geodesic_collinear), so the op stays on the CPU without shaderFloat64.
-                // GGML_VK_GEODESIC_NO_FP64 forces the float shader for testing only.
+                // (see test_geodesic_collinear), so the op stays on the CPU without shaderFloat64
                 if (!device->shader_float64) {
                     return false;
+                }
+                if (!ggml_vk_float_binding_supported(device, op)) {
+                    return false;
+                }
+                for (int i = 0; i < 4; i++) {
+                    if (!ggml_vk_float_binding_supported(device, op->src[i])) {
+                        return false;
+                    }
                 }
                 // shared reduction scratch: 3*(256 + 16) + 2 doubles
                 return device->properties.limits.maxComputeSharedMemorySize >= (3*(256 + 16) + 2)*sizeof(double) &&

@@ -13,12 +13,21 @@
 // gate and the MIMO output combine.
 //
 // Each state row p is owned by NSL invocations that stride over d (adjacent
-// invocations touch adjacent state elements), so the state update and the q.S
-// contraction share registers. As on the CPU, the R output contractions are
-// folded into one: with w[r] = mimo_o[r,p]*silu(z[r,p]),
+// invocations touch adjacent state elements). In the direct form the state
+// update and the q.S contraction share registers: as on the CPU, the R output
+// contractions are folded into one, with w[r] = mimo_o[r,p]*silu(z[r,p]),
 //   y[p] = sum_d S[p,d]*(sum_r w[r]*q[r,d]) + D*sum_r w[r]*v[r,p]
 // and the NSL partial sums of a row meet in shared memory. No subgroup
 // operations are used, so the shader does not depend on the subgroup size.
+//
+// The CPU has two evaluation orders. For fewer than PREFILL_T tokens per
+// sequence it applies S = alpha*S + beta*kv_prev + gamma*kv directly. From
+// PREFILL_T on it carries U = S + delta*kv with delta = (1 - trap)*dt of the
+// next token, so that one update per token is enough:
+//   U = alpha*U + (gamma + delta)*kv
+//   y = sum_r w_r (q_r.U + D v_r - delta sum_r2 v_r2 (k_r2.q_r))
+// The two agree up to rounding, but not when gamma is lost against delta, so
+// the shader follows the CPU's choice.
 //
 // REG = 1 keeps the invocation's share of the state in registers for the whole
 // sequence (one load and one store of the state per ubatch instead of one per
@@ -27,6 +36,7 @@
 
 #define NTH   256
 #define MAX_R 8
+#define PREFILL_T 4 // M3_PREFILL_T of the CPU reference
 
 layout(constant_id = 0) const uint R    = 4;   // MIMO rank, <= MAX_R
 layout(constant_id = 1) const uint D_QK = 128; // multiple of 4, <= 4*NTH
@@ -38,8 +48,10 @@ layout(local_size_x = NTH, local_size_y = 1, local_size_z = 1) in;
 
 const uint N_ANG  = D_QK / 4;
 const uint SD     = D_QK * D_V;
-const uint TPG    = NTH / (2 * R);     // invocations per rms group
 const uint SREG   = (D_QK + NSL - 1) / NSL; // state elements per invocation
+// invocations per k.q product. When D_V is a multiple of 4 the CPU's own order depends on its
+// vector width; otherwise it is increasing d on every build, and the shader keeps that order.
+const uint GSPLIT = D_V % 4 == 0 ? NTH / (R * R) : 1;
 
 layout(binding = 0) readonly buffer Pdyn  { float pdyn[];   };
 layout(binding = 1) readonly buffer Pstat { float pstat[];  };
@@ -49,7 +61,8 @@ layout(binding = 4) readonly buffer MimoO { float mimo_o[]; };
 layout(binding = 5) readonly buffer Norms { float norms[];  };
 layout(binding = 6) readonly buffer Misc  { float misc[];   };
 layout(binding = 7) readonly buffer State { float s_in[];   };
-layout(binding = 8) buffer Dst            { float dst[];    };
+// coherent: in the prefill form an invocation reads state that others of its workgroup wrote
+layout(binding = 8) coherent buffer Dst   { float dst[];    };
 
 layout(push_constant) uniform PushConstants {
     // misalignment of each binding, in floats
@@ -72,18 +85,11 @@ shared float zb[R * D_V];
 shared float cs[N_ANG];
 shared float sn[N_ANG];
 shared float rms[2 * R];
-// The CPU sums the squares of a B/C group in double. With USE_FP64 the shader
-// does too; without it a second sum of pre-scaled values stands in when the
-// plain one overflows, so that a finite mean square never turns into infinity.
-#if USE_FP64
-shared double rpart[NTH];
-#else
-shared float rpart[NTH];
-shared float rpart_s[NTH];
-const float RMS_SCALE    = 3.552713678800501e-15;  // 2^-48
-const float RMS_SCALE_SQ = 1.2621774483536189e-29; // 2^-96
-#endif
-shared float apart[NTH];
+// The CPU sums the squares of a B/C group in double, in index order, and so
+// does the shader: the op needs shaderFloat64.
+shared float opart[R * NTH]; // direct form: the row's NSL partials. Prefill form: q_r.U of row p at [r*NTH + p*NSL]
+shared float gpart[NTH];     // prefill form: partials of G[r2][r] = k_r2 . q_r
+shared float gram[R * R];
 
 float softplus(float x) {
     return max(x, 0.0) + log(exp(-abs(x)) + 1.0);
@@ -137,8 +143,16 @@ void main() {
             sreg[i] = s_in[si + sp + d];
         }
     }
-    const uint g  = tid / TPG; // rms group
-    const uint gl = tid % TPG;
+
+    const bool look = T >= PREFILL_T;
+    float dt_n = 0.0, alpha_n = 0.0, trap_n = 0.0;
+    {
+        const uint ps = o_pstat + tok0 * pstat_s + h * (2 * D_V + 3);
+        dt_n    = softplus(pstat[ps + 2 * D_V] + dt_bias);
+        alpha_n = exp(min(-softplus(pstat[ps + 2 * D_V + 1]), -a_floor) * dt_n);
+        trap_n  = 1.0 / (1.0 + exp(-pstat[ps + 2 * D_V + 2]));
+    }
+    const float delta0 = (1.0 - trap_n) * dt_n;
 
     for (uint t = 0; t < T; ++t) {
         const uint tok = tok0 + t;
@@ -146,12 +160,20 @@ void main() {
         const uint pd  = o_pdyn  + tok * pdyn_s;
         const uint ps  = o_pstat + tok * pstat_s + h * (2 * D_V + 3);
 
-        const float dt    = softplus(pstat[ps + 2 * D_V] + dt_bias);
-        const float a     = min(-softplus(pstat[ps + 2 * D_V + 1]), -a_floor);
-        const float alpha = exp(a * dt);
-        const float trap  = 1.0 / (1.0 + exp(-pstat[ps + 2 * D_V + 2]));
+        const float dt    = dt_n;
+        const float alpha = alpha_n;
+        const float trap  = trap_n;
         const float beta  = (1.0 - trap) * dt * alpha;
         const float gamma = trap * dt;
+        float delta = 0.0; // (1 - trap)*dt of the next token
+        if (t + 1 < T) {
+            const uint pn = ps + pstat_s;
+            dt_n    = softplus(pstat[pn + 2 * D_V] + dt_bias);
+            alpha_n = exp(min(-softplus(pstat[pn + 2 * D_V + 1]), -a_floor) * dt_n);
+            trap_n  = 1.0 / (1.0 + exp(-pstat[pn + 2 * D_V + 2]));
+            delta   = (1.0 - trap_n) * dt_n;
+        }
+        const float c_look = gamma + delta;
 
         if (tid < N_ANG) {
             ang = wrap_angle(ang + tanh(pdyn[pd + 2 * R * D_QK + tid]) * 3.14159265358979 * dt);
@@ -160,57 +182,15 @@ void main() {
         }
 
         // rms scales of the 2R groups of B/C
-#if USE_FP64
-        {
-            double s = 0.0;
-            if (g < 2 * R) {
-                for (uint d = gl; d < D_QK; d += TPG) {
-                    const double x = double(pdyn[pd + g * D_QK + d]);
-                    s += x * x;
-                }
-            }
-            rpart[tid] = s;
-        }
-        barrier();
         if (tid < 2 * R) {
-            double s = 0.0;
-            for (uint i = 0; i < TPG; ++i) {
-                s += rpart[tid * TPG + i];
+            precise double s = 0.0;
+            for (uint d = 0; d < D_QK; ++d) {
+                const double x = double(pdyn[pd + tid * D_QK + d]);
+                s += x * x;
             }
             const float ms = float(s / double(D_QK));
             rms[tid] = isinf(ms) ? 0.0 : inversesqrt(ms + eps);
         }
-#else
-        {
-            float s = 0.0, ss = 0.0;
-            if (g < 2 * R) {
-                for (uint d = gl; d < D_QK; d += TPG) {
-                    const float x  = pdyn[pd + g * D_QK + d];
-                    const float xs = x * RMS_SCALE;
-                    s  += x * x;
-                    ss += xs * xs;
-                }
-            }
-            rpart[tid]   = s;
-            rpart_s[tid] = ss;
-        }
-        barrier();
-        if (tid < 2 * R) {
-            float s = 0.0, ss = 0.0;
-            for (uint i = 0; i < TPG; ++i) {
-                s  += rpart[tid * TPG + i];
-                ss += rpart_s[tid * TPG + i];
-            }
-            if (s > 1.0e38) {
-                // sqrt(mean + eps) = sqrt(mean_scaled + eps*2^-96) * 2^48; a mean above
-                // FLT_MAX (2^32 scaled) is infinite on the CPU, which makes the scale zero
-                const float ms = ss / float(D_QK);
-                rms[tid] = ms >= 4294967040.0 ? 0.0 : RMS_SCALE * inversesqrt(ms + eps * RMS_SCALE_SQ);
-            } else {
-                rms[tid] = inversesqrt(s / float(D_QK) + eps);
-            }
-        }
-#endif
         barrier();
 
         // operands: k (B groups) and q (C groups) with weight, bias and rotary; v and z
@@ -248,26 +228,31 @@ void main() {
         }
         barrier();
 
-        // state update and the partial output contraction of row p
-        float skip = 0.0;
+        // state update and the partial output contractions of row p
+        float vc[MAX_R], w[MAX_R];
         if (p < D_V) {
-            float vc[MAX_R], vp[MAX_R], w[MAX_R];
+            float vp[MAX_R];
             for (uint r = 0; r < R; ++r) {
                 vc[r] = vb[cur * R * D_V + r * D_V + p];
                 vp[r] = vb[prv * R * D_V + r * D_V + p];
                 const float zv = zb[r * D_V + p];
                 w[r]  = mimo_o[mo_h + r * D_V + p] * (zv / (1.0 + exp(-zv)));
-                skip += w[r] * vc[r];
             }
             const uint kc = cur * R * D_QK;
             const uint kp = prv * R * D_QK;
+            const bool need_prev = !look || t == 0;
+            // direct form: one contraction with sum_r w_r q_r, summed here. Prefill form:
+            // one per rank, summed below in the CPU's order
             float acc = 0.0;
             for (uint i = 0, d = sl; d < D_QK; ++i, d += NSL) {
-                float c_acc = 0.0, p_acc = 0.0, qw = 0.0;
+                float c_acc = 0.0, p_acc = 0.0;
                 for (uint r = 0; r < R; ++r) {
                     c_acc += vc[r] * kb[kc + r * D_QK + d];
-                    p_acc += vp[r] * kb[kp + r * D_QK + d];
-                    qw    += w[r]  * qb[r * D_QK + d];
+                }
+                if (need_prev) {
+                    for (uint r = 0; r < R; ++r) {
+                        p_acc += vp[r] * kb[kp + r * D_QK + d];
+                    }
                 }
                 float s;
                 if (REG != 0) {
@@ -277,26 +262,91 @@ void main() {
                 } else {
                     s = dst[so + sp + d];
                 }
-                s = alpha * s + beta * p_acc + gamma * c_acc;
+                if (look) {
+                    if (t == 0) {
+                        s += delta0 * p_acc; // U_0 = S_0 + delta_0 kv_0
+                    }
+                    s = alpha * s + c_look * c_acc;
+                } else {
+                    float qw = 0.0;
+                    for (uint r = 0; r < R; ++r) {
+                        qw += w[r] * qb[r * D_QK + d];
+                    }
+                    s = alpha * s + beta * p_acc + gamma * c_acc;
+                    acc += s * qw;
+                }
                 if (REG != 0) {
                     sreg[i] = s;
-                } else {
-                    dst[so + sp + d] = s;
                 }
-                acc += s * qw;
+                if (REG == 0 || look) {
+                    dst[so + sp + d] = s; // the prefill form reads the whole row back below
+                }
             }
-            apart[tid] = acc;
+            opart[tid] = acc;
+        }
+        // prefill correction: the R*R products k_r2 . q_r of this token
+        const bool gram_on = look && delta != 0.0;
+        if (gram_on && tid < GSPLIT * R * R) {
+            const uint pr = tid % (R * R);
+            const uint r2 = pr / R, r1 = pr % R;
+            float gsum = 0.0;
+            for (uint d = tid / (R * R); d < D_QK; d += GSPLIT) {
+                gsum += kb[cur * R * D_QK + r2 * D_QK + d] * qb[r1 * D_QK + d];
+            }
+            gpart[tid] = gsum;
+        }
+        memoryBarrierBuffer();
+        barrier();
+        if (gram_on && tid < R * R) {
+            float gsum = gpart[tid];
+            for (uint i = 1; i < GSPLIT; ++i) {
+                gsum += gpart[i * R * R + tid];
+            }
+            gram[tid] = gsum;
+        }
+        // prefill form: o_r = q_r.U of the row. The CPU adds it in increasing d on every
+        // build, and the epilogue's subtraction can expose a different order, so the
+        // row's invocations take one rank each and walk the whole row.
+        if (look && p < D_V) {
+            for (uint r = sl; r < R; r += NSL) {
+                precise float o = 0.0;
+                for (uint d = 0; d < D_QK; ++d) {
+                    o += qb[r * D_QK + d] * dst[so + sp + d];
+                }
+                opart[r * NTH + tid - sl] = o;
+            }
         }
         barrier();
 
-        // the row's partials, then the D skip, as on the CPU. Nothing read here
-        // is written before the second barrier of the next token.
+        // the row's partials and the D skip, combined as on the CPU. Nothing read
+        // here is written before the second barrier of the next token.
         if (sl == 0 && p < D_V) {
             float yp = 0.0;
-            for (uint i = 0; i < NSL; ++i) {
-                yp += apart[tid + i];
+            if (look) {
+                // y = sum_r w_r (o_r + D v_r - delta corr_r)
+                for (uint r = 0; r < R; ++r) {
+                    float e = opart[r * NTH + tid] + D_h * vc[r];
+                    if (delta != 0.0) {
+                        float c = 0.0;
+                        for (uint r2 = 0; r2 < R; ++r2) {
+                            c += vc[r2] * gram[r2 * R + r];
+                        }
+                        e -= delta * c;
+                    }
+                    yp += w[r] * e;
+                }
+            } else {
+                // y = sum_r (D w_r) v_r, then the contraction
+                for (uint r = 0; r < R; ++r) {
+                    yp += (D_h * w[r]) * vc[r];
+                }
+                float o = 0.0;
+                for (uint i = 0; i < NSL; ++i) {
+                    o += opart[tid + i];
+                }
+                yp += o;
             }
-            dst[o_dst + (tok * H + h) * D_V + p] = yp + D_h * skip;
+            dst[o_dst + (tok * H + h) * D_V + p] = yp;
         }
         prv = cur;
     }

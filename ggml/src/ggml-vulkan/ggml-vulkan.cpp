@@ -10382,6 +10382,7 @@ static void ggml_vk_geodesic(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t) (g->nb[1] / fs),   (uint32_t) (g->nb[2] / fs),   (uint32_t) (g->nb[3] / fs),
         (uint32_t) (dst->nb[1] / fs), (uint32_t) (dst->nb[2] / fs), (uint32_t) (dst->nb[3] / fs),
         ggml_get_op_params_f32(dst, 0),
+        0x1.001p0f, 0x1p-100f, // 1 + 2^-12 and 2^-100, see probe_fma() in geodesic.comp
     };
 
     // row = z*262144 + y*512 + x, see geodesic.comp

@@ -42,6 +42,7 @@ layout(push_constant) uniform PushConstants {
     uint sg1; uint sg2; uint sg3;
     uint sd1; uint sd2; uint sd3;
     float inv_depth;
+    float probe_a; float probe_c;                     // 1 + 2^-12 and 2^-100, see probe_fma()
 };
 
 shared ACC_TYPE pa[NTH];
@@ -59,13 +60,120 @@ bool ambiguous(const ACC_TYPE s, const ACC_TYPE a) {
     return float(s - d) != float(s + d);
 }
 
-// g - coef*x, fused: the reference CPU build (x86-64 with FMA, contraction on)
-// evaluates it with one rounding, and for a nearly collinear g the unfused
-// result differs by the whole tangent. The same form is used for the norm and
-// for the output.
+// Rounds a double to float. Mesa (RADV, llvmpipe) removes a double -> float ->
+// double round trip, so a plain float(v) that is widened again later keeps
+// its double value and the rounding the CPU performs is lost. The bits pass
+// through an integer operation the compiler cannot fold; the operand is zero
+// for every row that has elements.
+float to_float(const double v) {
+    return uintBitsToFloat(floatBitsToUint(float(v)) ^ uint(n == 0u));
+}
+
+// g - coef*x with one rounding: the reference CPU build (x86-64 with FMA,
+// contraction on) fuses it, and for a nearly collinear g the unfused result
+// differs by the whole tangent. The same form is used for the norm and for the
+// output.
+// A driver may lower fma() to a multiply and an add (llvmpipe does), so main()
+// first tests it on operands that arrive as push constants. Where it is fused it is
+// used directly. Elsewhere the result is built in double: the product of two
+// floats is exact, the sum is taken with its rounding error (TwoSum), and
+// rounding that double to float gives the fused result unless the double lies
+// halfway between two floats, where the sign of the error picks the side.
+// Halfway between FLT_MAX and 2^128 is handled first: the float nearest to it
+// is an infinity, which has no neighbor to step back to.
+bool fma_fused;
+
+// (1 + 2^-12)^2 + 2^-100 is 1 + 2^-11 + 2^-24 + 2^-100: just above halfway
+// between two floats, so one rounding gives 1 + 2^-11 + 2^-23. A product
+// rounded to float first, or a sum carried in double or any format narrower
+// than 100 bits and then rounded to float, lands on the halfway point or below
+// it and gives 1 + 2^-11.
+bool probe_fma() {
+    precise float r = fma(probe_a, probe_a, probe_c);
+    return floatBitsToUint(r) == 0x3f801001u;
+}
+
 float tangent(const float g, const float coef, const float x) {
-    precise float t = fma(-coef, x, g);
-    return t;
+    if (fma_fused) {
+        return fma(-coef, x, g);
+    }
+    precise double a  = double(g);
+    precise double b  = -(double(coef) * double(x));
+    precise double s  = a + b;
+    precise double bb = s - a;
+    precise double e  = (a - (s - bb)) + (b - bb);
+    const float  fmax = uintBitsToFloat(0x7f7fffffu);
+    const double mid  = double(fmax) + 1.0141204801825835e31LF; // 2^128 - 2^103
+    if (abs(s) == mid && e != 0.0 && (e < 0.0) != (s < 0.0)) {
+        return s < 0.0 ? -fmax : fmax; // the exact sum is below the midpoint
+    }
+    float f = to_float(s);
+    precise double d  = double(f) - s;
+    if (e != 0.0 && d != 0.0 && (e < 0.0) != (d < 0.0)) {
+        const float f2 = to_float(s - d); // the float on the other side of s
+        if (f2 != f && double(f2) + double(f) == 2.0 * s) {
+            f = f2;
+        }
+    }
+    return f;
+}
+
+// 1/(2 pi), 224 bits after a zero word
+const uint inv_2pi[8] = uint[8](0x00000000u, 0x28be60dbu, 0x9391054au, 0x7f09d5f4u,
+                                0x7d4d3770u, 0x36d8a566u, 0x4f10e410u, 0x7f9458eau);
+
+// fminf and fmaxf of the CPU: a NaN operand gives the other one. b is never a NaN.
+float fmin_c(const float a, const float b) { return isnan(a) ? b : isnan(b) ? a : min(a, b); }
+float fmax_c(const float a, const float b) { return isnan(a) ? b : isnan(b) ? a : max(a, b); }
+
+// sin and cos of theta. theta is clamped from above only; the sin and cos of
+// a driver lose accuracy for large arguments, and next to a zero of either
+// function a rounded angle loses the result. An angle below -pi/4 is
+// therefore split, in double, into a quarter turn count q and a rest r in
+// [-pi/4, pi/4], and the functions are taken of r.
+// -t = m 2^e with m a 24-bit integer. The fraction of m 2^e/(2 pi) needs only
+// the bits of 1/(2 pi) from position e + 1 on, since m times the bits before
+// them is a whole number of turns; 96 of them are used, in four products that
+// are exact in double.
+void sin_cos(const float t, out float sn, out float cs) {
+    if (!(t < -0.785398163) || isinf(t)) {
+        sn = sin(t);
+        cs = cos(t);
+        return;
+    }
+    const uint   b = floatBitsToUint(-t);
+    const double m = double((b & 0x7fffffu) | 0x800000u);
+    uint   o = (b >> 23) - 118u; // bit offset into inv_2pi of position e + 1, e = exponent - 150
+    double w = 5.9604644775390625e-08LF; // 2^-24
+    double f = 0.0;
+    for (uint k = 0u; k < 4u; ++k) {
+        const uint i  = o >> 5;
+        const uint sh = o & 31u;
+        uint v = inv_2pi[i] << sh;
+        if (sh != 0u) {
+            v |= inv_2pi[i + 1u] >> (32u - sh);
+        }
+        f += fract(m * double(v >> 8) * w);
+        w *= 5.9604644775390625e-08LF;
+        o += 24u;
+    }
+    f = fract(f); // -t in turns
+    const double q  = floor(4.0LF * f + 0.5LF);
+    const float  r  = float((f - 0.25LF * q) * 6.283185307179586LF);
+    const float  sr = sin(r);
+    const float  cr = cos(r);
+    const uint   qi = uint(q) & 3u;
+    // sin and cos of -t = q pi/2 + r
+    float s = (qi & 1u) == 0u ? sr : cr;
+    float c = (qi & 1u) == 0u ? cr : sr;
+    if (qi >= 2u) {
+        s = -s;
+    }
+    if (qi == 1u || qi == 2u) {
+        c = -c;
+    }
+    sn = -s;
+    cs = c;
 }
 
 void main() {
@@ -74,6 +182,7 @@ void main() {
         return; // whole workgroup: the dispatch grid is rounded up
     }
     const uint tid = gl_LocalInvocationID.x;
+    fma_fused = probe_fma();
 
     const uint i1 = row % ne1, i2 = (row / ne1) % ne2, i3 = row / (ne1 * ne2);
     const uint xr = o_x + i1 * sx1 + i2 * sx2 + i3 * sx3;
@@ -129,9 +238,9 @@ void main() {
         xx = s_a;
         xg = s_b;
     }
-    const float x_norm_sq = max(float(xx), 1e-12);
+    const float x_norm_sq = fmax_c(to_float(xx), 1e-12);
     // divided in double and rounded once, which equals the correctly rounded float quotient
-    const float coef      = float(ACC_TYPE(float(xg)) / ACC_TYPE(x_norm_sq));
+    const float coef      = to_float(ACC_TYPE(to_float(xg)) / ACC_TYPE(x_norm_sq));
 
     ACC_TYPE pp = 0.0;
     for (uint i = tid; i < n; i += NTH) {
@@ -167,12 +276,14 @@ void main() {
     }
 
     const float pi4      = 0.785398163;
-    const float tan_norm = max(sqrt(float(pp)), 1e-8);
+    const float tan_norm = fmax_c(sqrt(float(pp)), 1e-8);
     const float xn       = sqrt(x_norm_sq);
-    float theta = min(tan_norm / max(xn, 1e-6), pi4);
-    theta = min((theta * data_s[o_s] + data_b[o_b]) * inv_depth, pi4);
-    const float c = cos(theta);
-    const float s = sin(theta) * xn / tan_norm;
+    float theta = fmin_c(tan_norm / fmax_c(xn, 1e-6), pi4);
+    // theta*scale + bias with one rounding, as the reference CPU build fuses it
+    theta = fmin_c(tangent(data_b[o_b], -theta, data_s[o_s]) * inv_depth, pi4);
+    float sn, c;
+    sin_cos(theta, sn, c);
+    const float s = sn * xn / tan_norm;
 
     // an invocation reads only the elements it writes, so dst may alias x or g
     for (uint i = tid; i < n; i += NTH) {

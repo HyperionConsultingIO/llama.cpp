@@ -298,17 +298,31 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
     return tv;
 }
 
+static bool isinf_or_max(float f);
+
 // normalized mean squared error = mse(a, b) / mse(a, 0)
-static double nmse(const float * a, const float * b, size_t n) {
+// strict: FLT_MAX is an ordinary value. Otherwise it stands for an infinity, as in the caller's element check
+static double nmse(const float * a, const float * b, size_t n, bool strict = false) {
     double mse_a_b = 0.0;
     double mse_a_0 = 0.0;
 
     for (size_t i = 0; i < n; i++) {
-        float a_i = a[i];
-        float b_i = b[i];
+        // in double: the square of a large finite float overflows, and inf/inf is a NaN that passes any threshold
+        double a_i = a[i];
+        double b_i = b[i];
+
+        // infinities are compared element by element by the caller, and are no part of the error: a matched
+        // FLT_MAX sentinel left in the sums would hide any error of the other elements
+        if (strict ? (std::isinf(a_i) || std::isinf(b_i)) : (isinf_or_max(a[i]) || isinf_or_max(b[i]))) {
+            continue;
+        }
 
         mse_a_b += (a_i - b_i) * (a_i - b_i);
         mse_a_0 += a_i * a_i;
+    }
+
+    if (mse_a_0 == 0.0) {
+        return mse_a_b == 0.0 ? 0.0 : INFINITY; // an all-zero reference matches only an all-zero result
     }
 
     return mse_a_b / mse_a_0;
@@ -1236,8 +1250,24 @@ struct test_case {
         return max_nmse_err(backend);
     }
 
+    // the values the Vulkan backend must produce, for a case whose reference output depends on how the CPU
+    // backend was built; they replace the reference output. Empty: compare the two backends. Other
+    // backends are compared with the CPU as before.
+    virtual std::vector<float> expected() {
+        return {};
+    }
+
+    const ggml_tensor * err_tensor = nullptr; // the node whose output err() is given
+
+    // FLT_MAX stands for an infinity in tests that use it as a sentinel. A test of an arithmetic op returns
+    // true here: a finite reference, FLT_MAX included, then needs a finite result
+    virtual bool strict_inf() {
+        return false;
+    }
+
+    // a: the backend under test, b: the reference (CPU) backend
     virtual double err(const float * a, const float * b, size_t n) {
-        return nmse(a, b, n);
+        return nmse(b, a, n, strict_inf()); // normalized by the reference
     }
 
     virtual float grad_eps() {
@@ -1512,6 +1542,14 @@ struct test_case {
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
 
+            if (t1->op != GGML_OP_NONE &&
+                    strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(ud->backend1))), "Vulkan") == 0) {
+                std::vector<float> expected = ud->tc->expected();
+                if (expected.size() == f2.size()) {
+                    f2 = std::move(expected);
+                }
+            }
+
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
@@ -1519,9 +1557,13 @@ struct test_case {
                     ud->ok = false;
                     return true;
                 }
-                // check for infs: both must be inf of the same sign, or both must be finite
-                if (isinf_or_max(f1[i]) || isinf_or_max(f2[i])) {
-                    if (isinf_or_max(f1[i]) && isinf_or_max(f2[i])) {
+                // check for infs: both must be inf of the same sign, or both must be finite.
+                // A strict test counts only real infinities; its finite pairs, FLT_MAX included, go to err()
+                const bool strict = ud->tc->strict_inf();
+                const bool inf1 = strict ? std::isinf(f1[i]) : isinf_or_max(f1[i]);
+                const bool inf2 = strict ? std::isinf(f2[i]) : isinf_or_max(f2[i]);
+                if (inf1 || inf2) {
+                    if (inf1 && inf2) {
                         if (std::signbit(f1[i]) != std::signbit(f2[i])) {
                             printf("[%s] inf sign mismatch: %s=%f %s=%f ", ggml_op_desc(t1), bn1, f1[i], bn2, f2[i]);
                             ud->ok = false;
@@ -1535,8 +1577,9 @@ struct test_case {
                 }
             }
 
+            ud->tc->err_tensor = t1;
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
-            if (err > ud->tc->max_err(ud->backend1)) {
+            if (!(err <= ud->tc->max_err(ud->backend1))) { // a NaN metric fails
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
                 //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
@@ -4880,6 +4923,24 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 };
 
 // GGML_OP_MAMBA3_MIMO (fused Olala mixer core, raw projections in)
+// NMSE for a MAMBA3_MIMO result whose states start at state_off. The last n_ang_h floats of each state are
+// the rotary angles, kept wrapped to [-pi, pi]. Next to the wrap point an angle that differs by one ulp before
+// the wrap (tanh is not the same function in every libm and driver) comes out as +pi on one side and -pi on
+// the other. That is the same rotation, so such a pair is compared after moving it to the reference's side.
+// Only values within 1e-5 (about 40 ulps) of the wrap point qualify; the crossings seen were 3 to 7 ulps away.
+static double mamba3_err(const float * a, const float * b, size_t n, size_t state_off, size_t n_embd_s, size_t n_ang_h) {
+    const float pi = 3.14159265358979323846f;
+    std::vector<float> a2(a, a + n);
+    for (size_t s0 = state_off; s0 + n_embd_s <= n; s0 += n_embd_s) {
+        for (size_t i = s0 + n_embd_s - n_ang_h; i < s0 + n_embd_s; ++i) {
+            if (fabsf(fabsf(a[i]) - pi) < 1e-5f && fabsf(fabsf(b[i]) - pi) < 1e-5f && (a[i] < 0.0f) != (b[i] < 0.0f)) {
+                a2[i] = a[i] + (b[i] < 0.0f ? -2.0f*pi : 2.0f*pi);
+            }
+        }
+    }
+    return nmse(b, a2.data(), n, true);
+}
+
 struct test_mamba3_mimo : public test_case {
     const int64_t d_qk;
     const int64_t r; // MIMO rank
@@ -4895,22 +4956,60 @@ struct test_mamba3_mimo : public test_case {
                               // 3 and 4 (d_qk = 28) sums over d that lose their small terms only in index order:
                               // the output contraction (r = 1) and the k.q products (r = 8), 5 the same for
                               // the direct form with d_qk = 4, the one size whose order no CPU build changes
+    const int     probe;    // exact cases. 1: no angular increment and cached angles on both sides of the wrap,
+                            // compared without the periodic allowance. 2: eps = 5 and a bias that cancels k
+                            // exactly with the CPU's scale 1.0f/sqrtf(ms + eps); a scale one ulp off leaves k != 0.
+                            // 3: tiny angle projections (2^-30 to 2^-24) with a time step of 2^22, which
+                            // carries the relative error of tanh near zero into the rotary phase
+                            // 4: zero state and D, time steps softplus(-4 .. -15): the result is
+                            // proportional to log(1 + e) for an e of a few ulps of 1
 
     std::string vars() override {
         return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs) +
                (views ? ",views=1" : "") + (big_rms ? ",big_rms=" + std::to_string(big_rms) : "") +
-               (lost_gamma ? ",lost_gamma=" + std::to_string(lost_gamma) : "");
+               (lost_gamma ? ",lost_gamma=" + std::to_string(lost_gamma) : "") +
+               (probe ? ",probe=" + std::to_string(probe) : "");
+    }
+
+    bool strict_inf() override {
+        return true;
     }
 
     double max_nmse_err() override {
         return max_err; // 1e-6 by default: long recurrences through exp/tanh/sin/cos of different libms
     }
 
+    // The Vulkan kernels follow the CPU's evaluation order and are held to 1e-7 on every case.
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0) {
+            return std::min(max_nmse_err(), 1e-7);
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t H = head_count, n_ang_h = H*(d_qk/4);
+        const size_t n_embd_s = H*d_v*d_qk + H*r*d_qk + H*r*d_v + n_ang_h;
+        if (probe == 1) {
+            return test_case::err(a, b, n); // the wrap is decided by the cached angle alone
+        }
+        if (probe == 2) {
+            for (size_t i = 0; i < n; ++i) {
+                if (b[i] == 0.0f && a[i] != 0.0f) {
+                    return INFINITY; // k is not cancelled
+                }
+            }
+        }
+        return mamba3_err(a, b, n, n - n_embd_s*n_seqs, n_embd_s, n_ang_h); // y, then one state per sequence
+    }
+
     test_mamba3_mimo(int64_t d_qk = 128, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
             int64_t n_seq_tokens = 1, int64_t n_seqs = 1, double max_err = 1e-6, bool views = false, int big_rms = 0,
-            int lost_gamma = 0)
+            int lost_gamma = 0, int probe = 0)
         : d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
-          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), max_err(max_err), views(views), big_rms(big_rms), lost_gamma(lost_gamma) {}
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), max_err(max_err), views(views), big_rms(big_rms), lost_gamma(lost_gamma),
+          probe(probe) {}
 
     // a (ne0, ne1) view that starts one float into its buffer, with `pad` unused floats after every row
     ggml_tensor * offset_view(ggml_context * ctx, int64_t ne0, int64_t ne1, int64_t pad) {
@@ -4940,7 +5039,7 @@ struct test_mamba3_mimo : public test_case {
         ggml_tensor * state  = views ? offset_view(ctx, n_embd_s, n_seqs, 0)
                                      : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
         ggml_set_name(state, "state");
-        return ggml_mamba3_mimo(ctx, pdyn, pstat, bias, mxz, mimo_o, norms, misc, state, 1e-6f, 1e-4f);
+        return ggml_mamba3_mimo(ctx, pdyn, pstat, bias, mxz, mimo_o, norms, misc, state, probe == 2 ? 5.0f : 1e-6f, 1e-4f);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -4949,6 +5048,136 @@ struct test_mamba3_mimo : public test_case {
                 init_tensor_uniform(t, -0.5f, 0.5f);
             } else {
                 init_tensor_uniform(t);
+            }
+        }
+        if (probe == 1) {
+            // tanh(0) = 0: the new angle is the wrapped cached angle. 2^-17 beyond pi wraps, 2^-17 inside does not
+            GGML_ASSERT(!views);
+            const int64_t n_ang = d_qk/4, n_ang_h = head_count*n_ang;
+            const float pi = 3.14159265358979323846f, e = 0x1p-17f;
+            const float vals[8] = { pi + e, -(pi + e), pi - e, -(pi - e), 4.0f, -4.0f, 9.5f, -9.5f };
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (strcmp(t->name, "pdyn") == 0) {
+                    const std::vector<float> zero(n_ang, 0.0f);
+                    for (int64_t tok = 0; tok < t->ne[1]; ++tok) {
+                        ggml_backend_tensor_set(t, zero.data(), tok*t->nb[1] + 2*r*d_qk*sizeof(float), n_ang*sizeof(float));
+                    }
+                } else if (strcmp(t->name, "state") == 0) {
+                    std::vector<float> ang(n_ang_h);
+                    for (int64_t i = 0; i < n_ang_h; ++i) {
+                        ang[i] = vals[i % 8];
+                    }
+                    for (int64_t s = 0; s < t->ne[1]; ++s) {
+                        ggml_backend_tensor_set(t, ang.data(), s*t->nb[1] + (t->ne[0] - n_ang_h)*sizeof(float), n_ang_h*sizeof(float));
+                    }
+                }
+            }
+        }
+        if (probe == 5 || probe == 6) {
+            // everything zero but the angle projections and the raw time step: the cached phase is the only
+            // nonzero output. 5: tanh at the first float above 0.5 times a time step of about 2^19, where the
+            // wrap leaves exactly 0 (2 ulps of tanh leave 1/16). 6: softplus where 1 + exp(x) is next to a
+            // rounding midpoint (1 ulp of exp doubles the time step)
+            GGML_ASSERT(!views);
+            const float proj = probe == 5 ? 0x1.000002p-1f : 32.0f;
+            const float dt   = probe == 5 ? 0x1.14fc6cp+19f : -0x1.f12e74p+3f;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                if (strcmp(t->name, "pdyn") == 0) {
+                    for (int64_t tok = 0; tok < t->ne[1]; ++tok) {
+                        for (int64_t i = 0; i < d_qk/4; ++i) {
+                            data[tok*t->ne[0] + 2*r*d_qk + i] = (i + tok) % 2 == 0 ? proj : -proj;
+                        }
+                    }
+                } else if (strcmp(t->name, "pstat") == 0) {
+                    for (int64_t tok = 0; tok < t->ne[1]; ++tok) {
+                        for (int64_t h = 0; h < head_count; ++h) {
+                            data[tok*t->ne[0] + h*(2*d_v + 3) + 2*d_v] = dt;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            }
+        }
+        if (probe == 4) {
+            // zero state and small time steps: softplus of -4 to -15, where log(1 + e) is a few ulps of 1 away
+            // from 0. Everything in the result is then proportional to the time step
+            GGML_ASSERT(!views);
+            const float raw[6] = { -4.0f, -7.0f, -10.0f, -12.5f, -14.0f, -15.0f };
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (strcmp(t->name, "state") == 0) {
+                    const std::vector<float> zero(ggml_nelements(t), 0.0f);
+                    ggml_backend_tensor_set(t, zero.data(), 0, ggml_nbytes(t));
+                } else if (strcmp(t->name, "misc") == 0) {
+                    const std::vector<float> zero(ggml_nelements(t), 0.0f); // dt_bias and D
+                    ggml_backend_tensor_set(t, zero.data(), 0, ggml_nbytes(t));
+                } else if (strcmp(t->name, "pstat") == 0) {
+                    for (int64_t tok = 0; tok < t->ne[1]; ++tok) {
+                        for (int64_t h = 0; h < head_count; ++h) {
+                            const size_t off = tok*t->nb[1] + (h*(2*d_v + 3) + 2*d_v)*sizeof(float);
+                            ggml_backend_tensor_set(t, &raw[(tok + h) % 6], off, sizeof(float));                 // dt
+                            ggml_backend_tensor_set(t, &raw[(tok + 2*h + 1) % 6], off + sizeof(float), sizeof(float)); // a
+                        }
+                    }
+                }
+            }
+        }
+        if (probe == 3) {
+            GGML_ASSERT(!views);
+            const int64_t n_ang = d_qk/4;
+            const float tiny[4] = { 0x1p-30f, -0x1p-28f, 0x1p-26f, -0x1p-24f };
+            const float dt = 4194304.0f; // before softplus, which leaves it unchanged
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                const bool is_pdyn = strcmp(t->name, "pdyn") == 0;
+                if (!is_pdyn && strcmp(t->name, "pstat") != 0) {
+                    continue;
+                }
+                for (int64_t tok = 0; tok < t->ne[1]; ++tok) {
+                    if (is_pdyn) {
+                        std::vector<float> a(n_ang);
+                        for (int64_t i = 0; i < n_ang; ++i) {
+                            a[i] = tiny[(i + tok) % 4];
+                        }
+                        ggml_backend_tensor_set(t, a.data(), tok*t->nb[1] + 2*r*d_qk*sizeof(float), n_ang*sizeof(float));
+                    } else {
+                        for (int64_t h = 0; h < head_count; ++h) {
+                            ggml_backend_tensor_set(t, &dt, tok*t->nb[1] + (h*(2*d_v + 3) + 2*d_v)*sizeof(float), sizeof(float));
+                        }
+                    }
+                }
+            }
+        }
+        if (probe == 2) {
+            // one head, one token, zero state. Group g of B/C holds g + 1 everywhere: radicands (g + 1)^2 + 5,
+            // the first r of them for k. The bias of k is minus the CPU's scaled value, so k = 0
+            GGML_ASSERT(!views && head_count == 1 && n_seq_tokens == 1 && n_seqs == 1);
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                std::vector<float> data(ggml_nelements(t), 0.0f);
+                if (strcmp(t->name, "pdyn") == 0) {
+                    for (int64_t g = 0; g < 2*r; ++g) {
+                        std::fill(data.begin() + g*d_qk, data.begin() + (g + 1)*d_qk, (float) (g + 1));
+                    }
+                } else if (strcmp(t->name, "bias") == 0) {
+                    for (int64_t g = 0; g < r; ++g) {
+                        const float c = (float) (g + 1);
+                        double sum = 0.0;
+                        for (int64_t d = 0; d < d_qk; ++d) {
+                            sum += (double) c*(double) c;
+                        }
+                        const float sc = 1.0f/sqrtf((float) (sum/d_qk) + 5.0f);
+                        const float k  = c*sc;
+                        std::fill(data.begin() + g*d_qk, data.begin() + (g + 1)*d_qk, -k);
+                    }
+                } else if (strcmp(t->name, "pstat") == 0) {
+                    std::fill(data.begin(), data.begin() + d_v, 32.0f);        // z
+                    std::fill(data.begin() + d_v, data.begin() + 2*d_v, 1.0f); // x
+                    data[2*d_v] = data[2*d_v + 1] = 32.0f;                     // dt, a
+                } else if (strcmp(t->name, "mxz") == 0 || strcmp(t->name, "norms") == 0) {
+                    std::fill(data.begin(), data.end(), 1.0f);
+                } else if (strcmp(t->name, "mimo_o") == 0) {
+                    std::fill(data.begin(), data.end(), 1.0f/32.0f);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             }
         }
         if (lost_gamma) {
@@ -5045,6 +5274,10 @@ struct test_mamba3_mimo : public test_case {
 // GGML_OP_MAMBA3_MIMO + the cpy of the new state into the recurrent cache, as built by the
 // Olala graph (exercises the Metal MAMBA3_MIMO + CPY fusion)
 struct test_mamba3_mimo_cache_fusion : public test_case {
+    bool strict_inf() override {
+        return true;
+    }
+
     const int64_t d_qk;
     const int64_t r;
     const int64_t d_v;
@@ -5061,6 +5294,24 @@ struct test_mamba3_mimo_cache_fusion : public test_case {
 
     double max_nmse_err() override {
         return 1e-6;
+    }
+
+    // The Vulkan kernels follow the CPU's evaluation order and are held to 1e-7 on every case.
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0) {
+            return std::min(max_nmse_err(), 1e-7);
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        const size_t H = head_count, n_ang_h = H*(d_qk/4);
+        const size_t n_embd_s = H*d_v*d_qk + H*r*d_qk + H*r*d_v + n_ang_h;
+        if (err_tensor == nullptr || strcmp(err_tensor->name, "m3_cache_cpy") != 0) {
+            return test_case::err(a, b, n); // y
+        }
+        return mamba3_err(a, b, n, 0, n_embd_s, n_ang_h); // the copied states
     }
 
     test_mamba3_mimo_cache_fusion(int64_t d_qk = 128, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
@@ -5128,6 +5379,10 @@ struct test_mamba3_mimo_cache_fusion : public test_case {
 
 // GGML_OP_GEODESIC
 struct test_geodesic : public test_case {
+    bool strict_inf() override {
+        return true;
+    }
+
     const int64_t n_embd;
     const int64_t n_rows;
     const float   inv_depth;
@@ -5153,6 +5408,10 @@ struct test_geodesic : public test_case {
 // normalization amplifies to full size, so this catches backends that reduce the row sums less exactly than the CPU.
 // GGML_OP_GEODESIC on independently strided 3D/4D views that start one float into their buffers
 struct test_geodesic_views : public test_case {
+    bool strict_inf() override {
+        return true;
+    }
+
     const int64_t n_embd;
     const int64_t ne1, ne2, ne3;
 
@@ -5189,6 +5448,10 @@ struct test_geodesic_views : public test_case {
 // index order the squares of the small tail are lost one by one, summed in groups they
 // are not, and x.g/|x|^2 lands on either side of 1
 struct test_geodesic_sum_order : public test_case {
+    bool strict_inf() override {
+        return true;
+    }
+
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "GEODESIC_SUM_ORDER";
@@ -5228,6 +5491,10 @@ struct test_geodesic_sum_order : public test_case {
 };
 
 struct test_geodesic_collinear : public test_case {
+    bool strict_inf() override {
+        return true;
+    }
+
     const int64_t n_embd;
     const int64_t n_rows;
 
@@ -5237,13 +5504,16 @@ struct test_geodesic_collinear : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR2(n_embd, n_rows);
+        return VARS_TO_STR3(n_embd, n_rows, overflow);
     }
 
     const float x_val, g_val;
+    const bool  overflow; // a tangent just below the midpoint between FLT_MAX and 2^128 (n_embd = 4)
 
-    test_geodesic_collinear(int64_t n_embd = 1536, int64_t n_rows = 3, float x_val = 1.0f, float g_val = 0.3f)
-        : n_embd(n_embd), n_rows(n_rows), x_val(x_val), g_val(g_val) {}
+    test_geodesic_collinear(int64_t n_embd = 1536, int64_t n_rows = 3, float x_val = 1.0f, float g_val = 0.3f, bool overflow = false)
+        : n_embd(n_embd), n_rows(n_rows), x_val(x_val), g_val(g_val), overflow(overflow) {
+        GGML_ASSERT(!overflow || n_embd == 4);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
@@ -5261,6 +5531,100 @@ struct test_geodesic_collinear : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             const float v = strcmp(t->name, "x") == 0 ? x_val : strcmp(t->name, "g") == 0 ? g_val : strcmp(t->name, "bias") == 0 ? 0.25f : 0.0f;
             std::vector<float> data(ggml_nelements(t), v);
+            if (overflow) {
+                // x.g = 4c and |x|^2 rounds to 4, so coef = c = -(1 - u)*2^103 and
+                // g[0] - coef*x[0] = FLT_MAX + (1 - u^2)*2^103: finite when rounded once
+                const float u = 0x1p-23f;
+                const float c = -(1.0f - u)*0x1p103f;
+                const float xs[4] = { 1.0f + u, 1.0f + u, 1.0f, 1.0f - 2.0f*u };
+                const float gs[4] = { FLT_MAX, -FLT_MAX, 4.0f*c, 0.0f };
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = strcmp(t->name, "x") == 0 ? xs[i % 4] : strcmp(t->name, "g") == 0 ? gs[i % 4] : 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+
+    // The two cases whose result depends on the CPU fusing g - coef*x state the fused result.
+    // overflow: scale = bias = 0 and the output is x; an unfused CPU overflows instead.
+    // n_embd = 1: theta = bias, and the tangent is the rounding error of coef*x.
+    std::vector<float> expected() override {
+        std::vector<float> data;
+        if (n_embd == 1 && !overflow) {
+            const float coef = (float) ((double) x_val*g_val)/(x_val*x_val);
+            const float gp   = std::fma(-coef, x_val, g_val);
+            const float tn   = std::max(std::fabs(gp), 1e-8f);
+            data.assign(n_rows, x_val*cosf(0.25f) + gp*(sinf(0.25f)*std::fabs(x_val)/tn));
+        }
+        if (overflow) {
+            const float u = 0x1p-23f;
+            const float xs[4] = { 1.0f + u, 1.0f + u, 1.0f, 1.0f - 2.0f*u };
+            for (int64_t i = 0; i < n_embd*n_rows; i++) {
+                data.push_back(xs[i % 4]);
+            }
+        }
+        return data;
+    }
+};
+
+// GGML_OP_GEODESIC on x = (1, 0), g = (0, 1) with a chosen scale and bias: the row sums are exact and
+// theta = (pi/4*scale + bias)*inv_depth, so the case tests the angle alone. Only the upper end of theta is
+// clamped: a large negative bias reaches sin and cos as it is.
+struct test_geodesic_angle : public test_case {
+    bool strict_inf() override {
+        return true;
+    }
+
+    const float scale, bias;
+    const int   n_embd;    // 1: x = 1, g = 0, and the output is cos(theta) alone
+    const float inv_depth;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GEODESIC_ANGLE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(scale, bias, n_embd, inv_depth);
+    }
+
+    test_geodesic_angle(float scale, float bias, int n_embd = 2, float inv_depth = 1.0f)
+        : scale(scale), bias(bias), n_embd(n_embd), inv_depth(inv_depth) {}
+
+    // with a scale the angle depends on whether the CPU fuses pi/4*scale + bias; the fused value is expected
+    std::vector<float> expected() override {
+        std::vector<float> data;
+        if (scale != 0.0f && inv_depth == 1.0f && n_embd == 2) {
+            const float theta = std::fma(0.785398163f, scale, bias);
+            for (int i = 0; i < 3; i++) {
+                data.push_back(cosf(theta));
+                data.push_back(sinf(theta));
+            }
+        }
+        return data;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 3);
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 3);
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(x, "x");
+        ggml_set_name(g, "g");
+        ggml_set_name(s, "scale");
+        ggml_set_name(b, "bias");
+        return ggml_geodesic(ctx, x, g, s, b, inv_depth);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<float> data(ggml_nelements(t), strcmp(t->name, "scale") == 0 ? scale : bias);
+            if (strcmp(t->name, "x") == 0 || strcmp(t->name, "g") == 0) {
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = (i % 2 == 0 || n_embd == 1) == (t->name[0] == 'x') ? 1.0f : 0.0f;
+                }
+            }
             ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
         }
     }
@@ -7746,7 +8110,7 @@ struct test_topk_moe : public test_case {
         }
         std::sort(a2.begin(), a2.end());
         std::sort(b2.begin(), b2.end());
-        return nmse(a2.data(), b2.data(), n);
+        return nmse(b2.data(), a2.data(), n);
     }
 };
 
@@ -12057,6 +12421,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48,  1, 4)); // batched decode
     test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48, 96, 2)); // chunked prefill
     test_cases.emplace_back(new test_mamba3_mimo_cache_fusion( 16, 2,  8,  3, 33, 2)); // generic dims
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(  4, 1,  1,  1, 10, 1)); // y and the state have the same length
     test_cases.emplace_back(new test_geodesic(1536, 1, 1.0f));
     test_cases.emplace_back(new test_geodesic(1536, 7, 0.25f));
     test_cases.emplace_back(new test_geodesic(1536, 512, 1.0f/36));
@@ -12081,9 +12446,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mamba3_mimo( 28, 1,  1,  1,   4, 1, 1e-7, false, 0, 3));
     test_cases.emplace_back(new test_mamba3_mimo( 28, 8,  1,  1,   4, 1, 1e-7, false, 0, 4));
     test_cases.emplace_back(new test_mamba3_mimo(  4, 1, 128, 1,   1, 1, 1e-7, false, 0, 5));
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,   1, 2, 1e-7, false, 0, 0, 1)); // wrap boundary, decode
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,   5, 2, 1e-7, false, 0, 0, 1)); // wrap boundary, prefill
+    test_cases.emplace_back(new test_mamba3_mimo(  4, 8,  2,  1,   1, 1, 1e-7, false, 0, 0, 2)); // exact rms scale
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,   1, 2, 1e-7, false, 0, 0, 3)); // tanh near zero, decode
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,   5, 2, 1e-7, false, 0, 0, 3)); // tanh near zero, prefill
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,   1, 2, 1e-7, false, 0, 0, 4)); // softplus near zero, decode
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,   5, 2, 1e-7, false, 0, 0, 4)); // softplus near zero, prefill
+    test_cases.emplace_back(new test_mamba3_mimo(  4, 1,  1,  1,   1, 1, 1e-7, false, 0, 0, 5)); // tanh just above 0.5
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,   5, 2, 1e-7, false, 0, 0, 5));
+    test_cases.emplace_back(new test_mamba3_mimo(  4, 1,  1,  1,   1, 1, 1e-7, false, 0, 0, 6)); // exp at a midpoint of 1 + e
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,   5, 2, 1e-7, false, 0, 0, 6));
     test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 192, 2, 1e-7)); // multi-sequence prefill
     test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   3, 2, 1e-7)); // below the prefill threshold
     test_cases.emplace_back(new test_geodesic_collinear(1, 2, 3.0f, 1.0f)); // g - x/3: zero or 2^-25 depending on contraction
+    test_cases.emplace_back(new test_geodesic_collinear(4, 2, 0.0f, 0.0f, true));
+    test_cases.emplace_back(new test_geodesic_angle(0.0f, -3.5f));
+    test_cases.emplace_back(new test_geodesic_angle(0.0f, -32768.5f));
+    test_cases.emplace_back(new test_geodesic_angle(0.0f, -0x1p32f));
+    test_cases.emplace_back(new test_geodesic_angle(0.0f, -1e20f));
+    test_cases.emplace_back(new test_geodesic_angle(0.0f, -FLT_MAX));
+    test_cases.emplace_back(new test_geodesic_angle(25165824.0f, -19765192.0f)); // pi/4*scale + bias: 0.5 when fused, else 0
+    test_cases.emplace_back(new test_geodesic_angle(0.0f, -1.5707964f, 1));      // cos(theta) next to a zero
+    test_cases.emplace_back(new test_geodesic_angle(0.0f, -4.71238899230957f, 1));
+    test_cases.emplace_back(new test_geodesic_angle(0.0f, -56993.203125f, 1));   // reduces to the same float angle as the previous one
+    test_cases.emplace_back(new test_geodesic_angle(-FLT_MAX, -FLT_MAX, 2, 0.0f)); // -inf*0: fminf(NaN, pi/4) is pi/4
     // (type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale); Olala 7A1B: bf16, 1536, 384, 256, 768, 1536, 6, 2.45
     test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 1));
     test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 5));

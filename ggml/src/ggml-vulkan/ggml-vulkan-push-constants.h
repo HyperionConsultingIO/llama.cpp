@@ -719,6 +719,7 @@ struct vk_op_geodesic_push_constants {
     uint32_t sg1, sg2, sg3;
     uint32_t sd1, sd2, sd3;
     float inv_depth;
+    float probe_a, probe_c; // operands of the shader's fused multiply-add test
 };
 
 struct vk_op_ssm_scan_push_constants {

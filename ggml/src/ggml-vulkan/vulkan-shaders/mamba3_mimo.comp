@@ -91,8 +91,83 @@ shared float opart[R * NTH]; // direct form: the row's NSL partials. Prefill for
 shared float gpart[NTH];     // prefill form: partials of G[r2][r] = k_r2 . q_r
 shared float gram[R * R];
 
-float softplus(float x) {
-    return max(x, 0.0) + log(exp(-abs(x)) + 1.0);
+// fminf of the CPU: a NaN operand gives the other one
+float fmin_c(const float a, const float b) {
+    return isnan(a) ? b : isnan(b) ? a : min(a, b);
+}
+
+// exp, tanh and log(1 + e) in double, rounded once to float. The built-ins are a few ulps off, and the
+// model multiplies these results (a time step of 2^19 turned 2 ulps of tanh into 1/16 rad of phase;
+// 1 ulp of exp next to 1 doubled a small time step). tanh_c() equals a correctly rounded tanhf for every
+// float; exp_c() is the correctly rounded exponential
+double exp_d(const double x) {
+    const double k = floor(x * 1.4426950408889634lf + 0.5lf);
+    const double r = (x - k * 0.693147180369123816490lf) - k * 1.90821492927058770002e-10lf;
+    double p = 1.0lf / 6227020800.0lf;
+    p = p * r + 1.0lf / 479001600.0lf;
+    p = p * r + 1.0lf / 39916800.0lf;
+    p = p * r + 1.0lf / 3628800.0lf;
+    p = p * r + 1.0lf / 362880.0lf;
+    p = p * r + 1.0lf / 40320.0lf;
+    p = p * r + 1.0lf / 5040.0lf;
+    p = p * r + 1.0lf / 720.0lf;
+    p = p * r + 1.0lf / 120.0lf;
+    p = p * r + 1.0lf / 24.0lf;
+    p = p * r + 1.0lf / 6.0lf;
+    p = p * r + 0.5lf;
+    p = p * r + 1.0lf;
+    p = p * r + 1.0lf;
+    return p * packDouble2x32(uvec2(0u, uint(int(k) + 1023) << 20)); // 2^k
+}
+
+float exp_c(const float x) {
+    if (isnan(x)) {
+        return x;
+    }
+    if (x > 89.0) {
+        return uintBitsToFloat(0x7f800000u);
+    }
+    if (x < -104.0) {
+        return 0.0;
+    }
+    const double d = exp_d(double(x));
+    return d >= 3.4028235677973366e38lf ? uintBitsToFloat(0x7f800000u) : float(d);
+}
+
+// max(x, 0) + logf(expf(-|x|) + 1), the sum 1 + e rounded to float as on the CPU
+float softplus(const float x) {
+    const float  e = exp_c(-abs(x));
+    const float  s = uintBitsToFloat(floatBitsToUint(e + 1.0) ^ uint(H == 0u)); // in [1, 2]
+    const double f = double(s) - 1.0lf;
+    const double z = f / (2.0lf + f);
+    const double z2 = z * z;
+    double p = 0.0lf;
+    for (int n = 17; n >= 0; --n) {
+        p = p * z2 + 1.0lf / double(2 * n + 1);
+    }
+    return max(x, 0.0) + float(2.0lf * z * p);
+}
+
+// below 0.5 the (7, 6) Pade approximant, whose error there is below 1e-15 of the value (the built-in
+// has no relative accuracy for a tiny argument); then (1 - t)/(1 + t) with t = exp(-2|x|)
+float tanh_c(const float x) {
+    if (isnan(x)) {
+        return x;
+    }
+    const float a = abs(x);
+    if (a < 0.5) {
+        const double xd = double(x);
+        const double x2 = xd * xd;
+        const double nu = 135135.0lf + x2 * (17325.0lf + x2 * (378.0lf + x2));
+        const double de = 135135.0lf + x2 * (62370.0lf + x2 * (3150.0lf + x2 * 28.0lf));
+        return float(xd * nu / de);
+    }
+    if (a >= 10.0) {
+        return x < 0.0 ? -1.0 : 1.0;
+    }
+    const double t = exp_d(-2.0lf * double(a));
+    const float  v = float((1.0lf - t) / (1.0lf + t));
+    return x < 0.0 ? -v : v;
 }
 
 float wrap_angle(float a) {
@@ -149,8 +224,8 @@ void main() {
     {
         const uint ps = o_pstat + tok0 * pstat_s + h * (2 * D_V + 3);
         dt_n    = softplus(pstat[ps + 2 * D_V] + dt_bias);
-        alpha_n = exp(min(-softplus(pstat[ps + 2 * D_V + 1]), -a_floor) * dt_n);
-        trap_n  = 1.0 / (1.0 + exp(-pstat[ps + 2 * D_V + 2]));
+        alpha_n = exp_c(fmin_c(-softplus(pstat[ps + 2 * D_V + 1]), -a_floor) * dt_n);
+        trap_n  = 1.0 / (1.0 + exp_c(-pstat[ps + 2 * D_V + 2]));
     }
     const float delta0 = (1.0 - trap_n) * dt_n;
 
@@ -169,14 +244,14 @@ void main() {
         if (t + 1 < T) {
             const uint pn = ps + pstat_s;
             dt_n    = softplus(pstat[pn + 2 * D_V] + dt_bias);
-            alpha_n = exp(min(-softplus(pstat[pn + 2 * D_V + 1]), -a_floor) * dt_n);
-            trap_n  = 1.0 / (1.0 + exp(-pstat[pn + 2 * D_V + 2]));
+            alpha_n = exp_c(fmin_c(-softplus(pstat[pn + 2 * D_V + 1]), -a_floor) * dt_n);
+            trap_n  = 1.0 / (1.0 + exp_c(-pstat[pn + 2 * D_V + 2]));
             delta   = (1.0 - trap_n) * dt_n;
         }
         const float c_look = gamma + delta;
 
         if (tid < N_ANG) {
-            ang = wrap_angle(ang + tanh(pdyn[pd + 2 * R * D_QK + tid]) * 3.14159265358979 * dt);
+            ang = wrap_angle(ang + tanh_c(pdyn[pd + 2 * R * D_QK + tid]) * 3.14159265358979 * dt);
             cs[tid] = cos(ang);
             sn[tid] = sin(ang);
         }
@@ -188,8 +263,23 @@ void main() {
                 const double x = double(pdyn[pd + tid * D_QK + d]);
                 s += x * x;
             }
-            const float ms = float(s / double(D_QK));
-            rms[tid] = isinf(ms) ? 0.0 : inversesqrt(ms + eps);
+            // as the CPU's 1.0f/sqrtf(ms + eps): a rounded square root, then a rounded reciprocal.
+            // inversesqrt rounds once and differs by an ulp (radicand 6 on RADV), and so does float sqrt there. The other cases are
+            // written out: +inf gives 0, a zero an infinity of its sign, a negative or NaN radicand a NaN
+            const float rad = float(s / double(D_QK)) + eps;
+            if (rad > 0.0) {
+                // in double, where sqrt and the division are exact enough to round correctly to float.
+                // The compiler drops a double -> float -> double round trip, so the bits of the rounded
+                // root pass through an integer operation it cannot fold (H is never zero)
+                precise double root_d = sqrt(double(rad));
+                const float    root   = uintBitsToFloat(floatBitsToUint(float(root_d)) ^ uint(H == 0u));
+                precise double inv_d  = 1.0lf / double(root);
+                rms[tid] = isinf(rad) ? 0.0 : float(inv_d);
+            } else if (rad == 0.0) {
+                rms[tid] = uintBitsToFloat(0x7f800000u | (floatBitsToUint(rad) & 0x80000000u));
+            } else {
+                rms[tid] = uintBitsToFloat(0x7fc00000u);
+            }
         }
         barrier();
 

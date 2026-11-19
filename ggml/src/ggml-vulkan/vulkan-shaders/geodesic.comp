@@ -1,0 +1,192 @@
+#version 450
+
+// Olala geodesic residual (see ggml_geodesic in ggml.h), one workgroup per row:
+//   g_perp = g - (x.g/|x|^2) x
+//   theta  = min((min(|g_perp|/|x|, pi/4)*scale + bias)*inv_depth, pi/4)
+//   out    = x cos(theta) + (g_perp/|g_perp|) |x| sin(theta)
+// semantic reference: ggml_compute_forward_geodesic (ggml/src/ggml-cpu/ops.cpp).
+//
+// The CPU accumulates the row sums in double, in index order, and the result
+// can depend on that order: the sums are rounded to float, and a projection
+// coefficient x.g/|x|^2 that is one ulp off turns an exactly collinear g into
+// a spurious tangent that the normalization then amplifies.
+//
+// With USE_FP64 the shader reduces the sums in double too, in parallel (NTH
+// partials -> NRED partials -> every invocation adds the last NRED; no subgroup
+// operations). A float product is exact in double, so the parallel and the
+// CPU-order sum differ by at most 2(n-1)u*sum|terms| (u = 2^-53). When every
+// value within that distance rounds to the same float, the parallel sum is
+// the CPU's result. Otherwise the row is ambiguous, and the first invocation
+// redoes the sum serially in the CPU's order.
+//
+// Without USE_FP64 the sums are float and not CPU-exact; the backend only uses
+// that variant when asked to.
+
+#if USE_FP64
+#define ACC_TYPE double
+#else
+#define ACC_TYPE float
+#endif
+
+#define NTH  256
+#define NRED 16
+
+layout(local_size_x = NTH, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X     { float data_x[]; };
+layout(binding = 1) readonly buffer G     { float data_g[]; };
+layout(binding = 2) readonly buffer Scale { float data_s[]; };
+layout(binding = 3) readonly buffer Bias  { float data_b[]; };
+layout(binding = 4) buffer D              { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint o_x; uint o_g; uint o_s; uint o_b; uint o_d; // misalignment of each binding, in floats
+    uint n;                                           // row length
+    uint nr;                                          // number of rows
+    uint ne1; uint ne2;
+    uint sx1; uint sx2; uint sx3;                     // row strides, in floats
+    uint sg1; uint sg2; uint sg3;
+    uint sd1; uint sd2; uint sd3;
+    float inv_depth;
+};
+
+shared ACC_TYPE pa[NTH];
+shared ACC_TYPE pb[NTH];
+shared ACC_TYPE pc[NTH];
+shared ACC_TYPE ra[NRED];
+shared ACC_TYPE rb[NRED];
+shared ACC_TYPE rc[NRED];
+shared ACC_TYPE s_a; // CPU-order sums of an ambiguous row
+shared ACC_TYPE s_b;
+
+// true when a sum in another order of terms of total magnitude a could round to a different float
+bool ambiguous(const ACC_TYPE s, const ACC_TYPE a) {
+#if USE_FP64
+    const double d = double(n) * a * 4.440892098500626e-16LF; // 4u per term, twice the bound
+    return float(s - d) != float(s + d);
+#else
+    return false;
+#endif
+}
+
+// g - coef*x, fused: the reference CPU build (x86-64 with FMA, contraction on)
+// evaluates it with one rounding, and for a nearly collinear g the unfused
+// result differs by the whole tangent. The same form is used for the norm and
+// for the output.
+float tangent(const float g, const float coef, const float x) {
+    precise float t = fma(-coef, x, g);
+    return t;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    if (row >= nr) {
+        return; // whole workgroup: the dispatch grid is rounded up
+    }
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint i1 = row % ne1, i2 = (row / ne1) % ne2, i3 = row / (ne1 * ne2);
+    const uint xr = o_x + i1 * sx1 + i2 * sx2 + i3 * sx3;
+    const uint gr = o_g + i1 * sg1 + i2 * sg2 + i3 * sg3;
+    const uint yr = o_d + i1 * sd1 + i2 * sd2 + i3 * sd3;
+
+    ACC_TYPE xx = 0.0, xg = 0.0, ag = 0.0;
+    for (uint i = tid; i < n; i += NTH) {
+        const ACC_TYPE x = ACC_TYPE(data_x[xr + i]);
+        const ACC_TYPE t = x * ACC_TYPE(data_g[gr + i]);
+        xx += x * x;
+        xg += t;
+        ag += abs(t);
+    }
+    pa[tid] = xx;
+    pb[tid] = xg;
+    pc[tid] = ag;
+    barrier();
+    if (tid < NRED) {
+        ACC_TYPE a = 0.0, b = 0.0, c = 0.0;
+        for (uint i = 0; i < NTH / NRED; ++i) {
+            a += pa[tid * (NTH / NRED) + i];
+            b += pb[tid * (NTH / NRED) + i];
+            c += pc[tid * (NTH / NRED) + i];
+        }
+        ra[tid] = a;
+        rb[tid] = b;
+        rc[tid] = c;
+    }
+    barrier();
+    xx = 0.0;
+    xg = 0.0;
+    ag = 0.0;
+    for (uint i = 0; i < NRED; ++i) {
+        xx += ra[i];
+        xg += rb[i];
+        ag += rc[i];
+    }
+    // every invocation adds the same values in the same order, so they all decide alike
+    bool amb = ambiguous(xx, xx) || ambiguous(xg, ag);
+    if (amb && tid == 0) {
+        precise ACC_TYPE a = 0.0, b = 0.0;
+        for (uint i = 0; i < n; ++i) {
+            const ACC_TYPE x = ACC_TYPE(data_x[xr + i]);
+            a += x * x;
+            b += x * ACC_TYPE(data_g[gr + i]);
+        }
+        s_a = a;
+        s_b = b;
+    }
+    barrier();
+    if (amb) {
+        xx = s_a;
+        xg = s_b;
+    }
+    const float x_norm_sq = max(float(xx), 1e-12);
+    // divided in double and rounded once, which equals the correctly rounded float quotient
+    const float coef      = float(ACC_TYPE(float(xg)) / ACC_TYPE(x_norm_sq));
+
+    ACC_TYPE pp = 0.0;
+    for (uint i = tid; i < n; i += NTH) {
+        const float gp = tangent(data_g[gr + i], coef, data_x[xr + i]);
+        pp += ACC_TYPE(gp) * ACC_TYPE(gp);
+    }
+    pa[tid] = pp;
+    barrier();
+    if (tid < NRED) {
+        ACC_TYPE a = 0.0;
+        for (uint i = 0; i < NTH / NRED; ++i) {
+            a += pa[tid * (NTH / NRED) + i];
+        }
+        ra[tid] = a;
+    }
+    barrier();
+    pp = 0.0;
+    for (uint i = 0; i < NRED; ++i) {
+        pp += ra[i];
+    }
+    amb = ambiguous(pp, pp);
+    if (amb && tid == 0) {
+        precise ACC_TYPE a = 0.0;
+        for (uint i = 0; i < n; ++i) {
+            const float gp = tangent(data_g[gr + i], coef, data_x[xr + i]);
+            a += ACC_TYPE(gp) * ACC_TYPE(gp);
+        }
+        s_a = a;
+    }
+    barrier();
+    if (amb) {
+        pp = s_a;
+    }
+
+    const float pi4      = 0.785398163;
+    const float tan_norm = max(sqrt(float(pp)), 1e-8);
+    const float xn       = sqrt(x_norm_sq);
+    float theta = min(tan_norm / max(xn, 1e-6), pi4);
+    theta = min((theta * data_s[o_s] + data_b[o_b]) * inv_depth, pi4);
+    const float c = cos(theta);
+    const float s = sin(theta) * xn / tan_norm;
+
+    // an invocation reads only the elements it writes, so dst may alias x or g
+    for (uint i = tid; i < n; i += NTH) {
+        const float x = data_x[xr + i];
+        data_d[yr + i] = x * c + tangent(data_g[gr + i], coef, x) * s;
+    }
+}

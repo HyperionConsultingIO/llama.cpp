@@ -4887,31 +4887,45 @@ struct test_mamba3_mimo : public test_case {
     const int64_t head_count;
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
+    const double  max_err;
+    const bool    views;    // projections and state are offset views, the projections with padded rows
+    const int     big_rms;  // B/C values whose squares overflow a float: 1 one per group, 2 all of them
 
     std::string vars() override {
-        return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs);
+        return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs) +
+               (views ? ",views=1" : "") + (big_rms ? ",big_rms=" + std::to_string(big_rms) : "");
     }
 
     double max_nmse_err() override {
-        return 1e-6; // long recurrences through exp/tanh/sin/cos of different libms
+        return max_err; // 1e-6 by default: long recurrences through exp/tanh/sin/cos of different libms
     }
 
     test_mamba3_mimo(int64_t d_qk = 128, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
-            int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1, double max_err = 1e-6, bool views = false, int big_rms = 0)
         : d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
-          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), max_err(max_err), views(views), big_rms(big_rms) {}
+
+    // a (ne0, ne1) view that starts one float into its buffer, with `pad` unused floats after every row
+    ggml_tensor * offset_view(ggml_context * ctx, int64_t ne0, int64_t ne1, int64_t pad) {
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (ne0 + pad)*ne1 + 1);
+        return ggml_view_2d(ctx, base, ne0, ne1, (ne0 + pad)*sizeof(float), sizeof(float));
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t H = head_count, n_tok = n_seq_tokens * n_seqs, n_ang = d_qk / 4;
         const int64_t n_embd_s = H*d_v*d_qk + H*r*d_qk + H*r*d_v + H*n_ang;
-        ggml_tensor * pdyn   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*r*d_qk + n_ang, n_tok);
-        ggml_tensor * pstat  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2*d_v + 3)*H, n_tok);
+        ggml_tensor * pdyn   = views ? offset_view(ctx, 2*r*d_qk + n_ang, n_tok, 3)
+                                     : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*r*d_qk + n_ang, n_tok);
+        ggml_tensor * pstat  = views ? offset_view(ctx, (2*d_v + 3)*H, n_tok, 5)
+                                     : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2*d_v + 3)*H, n_tok);
+        ggml_set_name(pdyn, "pdyn");
         ggml_tensor * bias   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_qk, 2*r, H);
         ggml_tensor * mxz    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, 2*r, H);
         ggml_tensor * mimo_o = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, r, H);
         ggml_tensor * norms  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_qk, 2);
         ggml_tensor * misc   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
-        ggml_tensor * state  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
+        ggml_tensor * state  = views ? offset_view(ctx, n_embd_s, n_seqs, 0)
+                                     : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
         ggml_set_name(state, "state");
         return ggml_mamba3_mimo(ctx, pdyn, pstat, bias, mxz, mimo_o, norms, misc, state, 1e-6f, 1e-4f);
     }
@@ -4922,6 +4936,23 @@ struct test_mamba3_mimo : public test_case {
                 init_tensor_uniform(t, -0.5f, 0.5f);
             } else {
                 init_tensor_uniform(t);
+            }
+        }
+        if (big_rms) {
+            // 3e19 squared is above FLT_MAX. With one such value the mean square of the
+            // group is not; with all of them it is, and the CPU's scale becomes zero
+            const float big = 3e19f;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (strcmp(t->name, "pdyn") != 0) {
+                    continue;
+                }
+                for (int64_t tok = 0; tok < t->ne[1]; ++tok) {
+                    for (int64_t g = 0; g < 2*r; ++g) {
+                        for (int64_t d = 0; d < (big_rms == 2 ? d_qk : 1); ++d) {
+                            ggml_backend_tensor_set(t, &big, tok*t->nb[1] + (g*d_qk + d)*sizeof(float), sizeof(float));
+                        }
+                    }
+                }
             }
         }
     }
@@ -5030,6 +5061,124 @@ struct test_geodesic : public test_case {
         ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         ggml_tensor * bias  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         return ggml_geodesic(ctx, x, g, scale, bias, inv_depth);
+    }
+};
+
+// GGML_OP_GEODESIC with g exactly collinear with x: the tangent is zero, so the result is x*cos(theta) with
+// theta = bias*inv_depth. A projection coefficient that is one ulp off leaves a spurious tangent which the
+// normalization amplifies to full size, so this catches backends that reduce the row sums less exactly than the CPU.
+// GGML_OP_GEODESIC on independently strided 3D/4D views that start one float into their buffers
+struct test_geodesic_views : public test_case {
+    const int64_t n_embd;
+    const int64_t ne1, ne2, ne3;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GEODESIC_VIEWS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, ne1, ne2, ne3);
+    }
+
+    test_geodesic_views(int64_t n_embd = 100, int64_t ne1 = 27, int64_t ne2 = 20, int64_t ne3 = 1)
+        : n_embd(n_embd), ne1(ne1), ne2(ne2), ne3(ne3) {}
+
+    ggml_tensor * view(ggml_context * ctx, int64_t pad0, int64_t pad1, int64_t pad2) {
+        const size_t nb1 = (n_embd + pad0)*sizeof(float);
+        const size_t nb2 = nb1*(ne1 + pad1);
+        const size_t nb3 = nb2*(ne2 + pad2);
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nb3*ne3/sizeof(float) + 1);
+        return ggml_view_4d(ctx, base, n_embd, ne1, ne2, ne3, nb1, nb2, nb3, sizeof(float));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = view(ctx, 3, 1, 2);
+        ggml_tensor * g     = view(ctx, 5, 2, 0);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * bias  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        return ggml_geodesic(ctx, x, g, scale, bias, 0.5f);
+    }
+};
+
+// GGML_OP_GEODESIC on a row whose sums depend on the order of accumulation: summed in
+// index order the squares of the small tail are lost one by one, summed in groups they
+// are not, and x.g/|x|^2 lands on either side of 1
+struct test_geodesic_sum_order : public test_case {
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GEODESIC_SUM_ORDER";
+    }
+
+    std::string vars() override {
+        return "n_embd=32";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 2);
+        ggml_tensor * g     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 2);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * bias  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(x, "x");
+        ggml_set_name(g, "g");
+        ggml_set_name(scale, "scale");
+        ggml_set_name(bias, "bias");
+        return ggml_geodesic(ctx, x, g, scale, bias, 1.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<float> data(ggml_nelements(t), strcmp(t->name, "bias") == 0 ? 0.25f : 0.0f);
+            if (strcmp(t->name, "x") == 0 || strcmp(t->name, "g") == 0) {
+                for (int row = 0; row < 2; ++row) {
+                    data[row*32 + 0] = 1.0f;
+                    data[row*32 + 1] = 0x1p-12f;
+                    for (int i = 16; i < 32 && t->name[0] == 'x'; ++i) {
+                        data[row*32 + i] = 0x1p-27f;
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
+struct test_geodesic_collinear : public test_case {
+    const int64_t n_embd;
+    const int64_t n_rows;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GEODESIC_COLLINEAR";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_rows);
+    }
+
+    const float x_val, g_val;
+
+    test_geodesic_collinear(int64_t n_embd = 1536, int64_t n_rows = 3, float x_val = 1.0f, float g_val = 0.3f)
+        : n_embd(n_embd), n_rows(n_rows), x_val(x_val), g_val(g_val) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_tensor * g     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * bias  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(x, "x");
+        ggml_set_name(g, "g");
+        ggml_set_name(scale, "scale");
+        ggml_set_name(bias, "bias");
+        return ggml_geodesic(ctx, x, g, scale, bias, 1.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const float v = strcmp(t->name, "x") == 0 ? x_val : strcmp(t->name, "g") == 0 ? g_val : strcmp(t->name, "bias") == 0 ? 0.25f : 0.0f;
+            std::vector<float> data(ggml_nelements(t), v);
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
     }
 };
 
@@ -11828,6 +11977,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_geodesic(1536, 7, 0.25f));
     test_cases.emplace_back(new test_geodesic(1536, 512, 1.0f/36));
     test_cases.emplace_back(new test_geodesic(100, 3, 0.5f));
+    test_cases.emplace_back(new test_geodesic_collinear(1536, 3));
+    test_cases.emplace_back(new test_geodesic_collinear(100, 2));
+    test_cases.emplace_back(new test_geodesic_sum_order());
+    test_cases.emplace_back(new test_geodesic_views(100, 27, 20, 1)); // 3D, 540 rows
+    test_cases.emplace_back(new test_geodesic_views( 64,  9,  8, 8)); // 4D, 576 rows
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 1, 32,  4,   9, 2, 1e-7)); // rank 1
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 8, 16,  4,   9, 2, 1e-7)); // rank 8
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 512, 1, 1e-7)); // full ubatch
+    test_cases.emplace_back(new test_mamba3_mimo(132, 2, 256, 2,   5, 2, 1e-7)); // one invocation per state row, state reloaded every token
+    test_cases.emplace_back(new test_mamba3_mimo(132, 2, 256, 2,   5, 2, 1e-7, true)); // the same on offset, padded views
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 4, 32,  3,   4, 3, 1e-7, true));
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   1, 1, 1e-7, true));
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 4, 32,  3,   4, 2, 1e-7, false, 1)); // rms of values whose squares overflow a float
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   1, 1, 1e-7, false, 1));
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 4, 32,  3,   4, 2, 1e-7, false, 2)); // and whose mean square does too
+    test_cases.emplace_back(new test_geodesic_collinear(1, 2, 3.0f, 1.0f)); // g - x/3: zero or 2^-25 depending on contraction
     // (type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale); Olala 7A1B: bf16, 1536, 384, 256, 768, 1536, 6, 2.45
     test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 1));
     test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 5));
